@@ -3,8 +3,8 @@ namespace ProofOfConcept;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Collections.Concurrent;
 using System.Threading.Tasks;
@@ -26,7 +26,7 @@ public class proof_of_concept : IDisposable
 
     private int _blockNum = 5;
 
-    private int _repetitionNum = 50;
+    private int _repetitionNum = 100;
 
     private byte[] _buffer;
 
@@ -36,10 +36,10 @@ public class proof_of_concept : IDisposable
     }
 
     public string Base64Encode(string plainText)
-        {
-            var plainTextBytes = Encoding.UTF8.GetBytes(plainText);
-            return Convert.ToBase64String(plainTextBytes);
-        }
+    {
+        var plainTextBytes = Encoding.UTF8.GetBytes(plainText);
+        return Convert.ToBase64String(plainTextBytes);
+    }
 
     private async Task<(string?, DateTimeOffset?, List<string>)> GetAllBlockIdsAsync(CloudBlockBlob blob)
     {
@@ -67,7 +67,7 @@ public class proof_of_concept : IDisposable
     }
 
     [Fact]
-    public async  void parallel_writing_workaround()
+    public async void parallel_writing_workaround()
     {
         var client = CloudStorageAccount.Parse(_connectionString).CreateCloudBlobClient();
         var logBlobContainerName = "dev-" + Guid.NewGuid().ToString();
@@ -82,7 +82,6 @@ public class proof_of_concept : IDisposable
         var tasks = new Task[_blockNum];
         var error412Count = 0;
         var error400Count = 0;
-        var hashSet = new ConcurrentBag<string>();
         for (int reps = 0; reps < _repetitionNum; reps++)
         {
             Task.Delay(100).Wait();
@@ -91,7 +90,6 @@ public class proof_of_concept : IDisposable
                 tasks[i] = Task.Run(async () =>
                 {
                     var operatingBlock = GetNewBlockId();
-                    hashSet.Add(operatingBlock);
                     while (true)
                     {
                         try
@@ -120,7 +118,7 @@ public class proof_of_concept : IDisposable
                                 options: new BlobRequestOptions(),
                                 operationContext: new OperationContext(),
                                 cancellationToken: default).ConfigureAwait(false);
-                            
+
                             var (_, _, commitedBlocks) = await GetAllBlockIdsAsync(blob);
                             if (Enumerable.SequenceEqual(blockIds, commitedBlocks))
                                 break;
@@ -148,7 +146,6 @@ public class proof_of_concept : IDisposable
 
         var blocks = await blob.DownloadBlockListAsync();
 
-        Assert.Equal(_blockNum * _repetitionNum, hashSet.ToArray().Length);
         Assert.Equal((0, 0, _blockNum * _repetitionNum), (error400Count, error412Count, blocks.ToArray().Length));
     }
 
@@ -169,7 +166,7 @@ public class proof_of_concept : IDisposable
         var error412Count = 0;
         var error400Count = 0;
         var isInfinite = false;
-        
+
         int blockIdLength = GetNewBlockId().Length;
 
         for (int i = 0; i < _blockNum; i++)
@@ -177,7 +174,7 @@ public class proof_of_concept : IDisposable
             tasks[i] = Task.Run(async () =>
             {
                 var operatingBlock = GetNewBlockId();
-                
+
                 // Simple check to verify whether block ids have the same length.
                 if (blockIdLength != operatingBlock.Length)
                     throw new Exception("Block id lengths are different.");
@@ -242,21 +239,24 @@ public class proof_of_concept : IDisposable
         Assert.Equal(_blockNum, blocks.ToArray().Length);
     }
 
-    private async Task<(Azure.ETag?, DateTimeOffset?, List<string>)> NewGetAllBlockIdsAsync(BlockBlobClient blob)
+    private async Task<(Azure.ETag?, DateTimeOffset?, List<string>, List<string>)> NewGetAllBlockIdsAsync(BlockBlobClient blob)
     {
         try
         {
-            var blockItems = await blob.GetBlockListAsync();
             var etag = blob.GetProperties().Value.ETag;
             var lastModified = blob.GetProperties().Value.LastModified;
-            var blockIds = blockItems.Value.CommittedBlocks.Select(b => b.Name).ToList();
-            return (etag, lastModified, blockIds);
+
+            var blockItems = await blob.GetBlockListAsync();
+            var commitedBlockIds = blockItems.Value.CommittedBlocks.Select(b => b.Name).ToList();
+            var uncommitedBlockIds = blockItems.Value.UncommittedBlocks.Select(b => b.Name).ToList();
+
+            return (etag, lastModified, commitedBlockIds, uncommitedBlockIds);
         }
         // Storage exception can be thrown if there is no any written blob.
         catch (Azure.RequestFailedException e)
         {
             if (e.Status == 404)
-                return (null, null, new List<string>());
+                return (null, null, new List<string>(), new List<string>());
             else
                 throw;
         }
@@ -272,7 +272,7 @@ public class proof_of_concept : IDisposable
         var contentHash = MD5.Create().ComputeHash(_buffer, 0, _buffer.Length);
         var blob = containerClient.Value.GetBlockBlobClient(blobid);
         blob.CommitBlockList(new List<string>());
-        
+
         var tasks = new Task[_blockNum];
         var error400 = 0;
         var error412 = 0;
@@ -286,17 +286,21 @@ public class proof_of_concept : IDisposable
                     var stream = new MemoryStream(_buffer);
                     var blockid = GetNewBlockId();
                     var conditions = new BlobRequestConditions();
-                    
+
                     while (true)
                     {
                         try
                         {
                             stream.Position = 0;
-                            var (etag, lastModified, commitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+                            var (etag, lastModified, commitedBlocks, uncommitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+                            // In our application, any staged block will be commited,
+                            // thus we wait until all blocks are commited.
+                            if (uncommitedBlocks.Count != 0 && !uncommitedBlocks.Contains(blockid))
+                                continue;
 
                             // stage block
                             await blob.StageBlockAsync(blockid, stream, contentHash);
-
+                            
                             if (!commitedBlocks.Contains(blockid))
                                 commitedBlocks.Add(blockid);
 
@@ -307,7 +311,10 @@ public class proof_of_concept : IDisposable
                             await blob.CommitBlockListAsync(
                                 commitedBlocks,
                                 conditions: conditions);
-                            break;
+
+                            var  (_, _, writtenBlocks, unwrittenBlocks) = await NewGetAllBlockIdsAsync(blob);
+                            if (Enumerable.SequenceEqual(commitedBlocks, writtenBlocks))
+                                break;
                         }
                         catch (Azure.RequestFailedException e)
                         {
@@ -325,6 +332,7 @@ public class proof_of_concept : IDisposable
                             }
                         }
                     }
+
                 });
             }
             Task.WaitAll(tasks);
@@ -332,8 +340,17 @@ public class proof_of_concept : IDisposable
 
         var blocks = await blob.GetBlockListAsync();
 
+        var query = blocks.Value.CommittedBlocks
+            .Select(b => b.Name)
+            .GroupBy(x => x)
+            .Where(g => g.Count() > 1)
+            .Select(y => y.Key)
+            .ToList();
+
+        Assert.Equal(0, query.Count);
+
         Assert.Equal(
-            (0, 0, _blockNum * _repetitionNum), 
+            (0, 0, _blockNum * _repetitionNum),
             (error400, error412, blocks.Value.CommittedBlocks.ToArray().Length));
     }
 
@@ -360,12 +377,12 @@ public class proof_of_concept : IDisposable
                 {
                     var stream = new MemoryStream(_buffer);
                     var blockid = GetNewBlockId();
-                    
+
                     if (blockIdLength != blockid.Length)
                         throw new Exception("Different block id length.");
 
                     var conditions = new BlobRequestConditions();
-                    var (etag, lastModified, commitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+                    var (etag, lastModified, commitedBlocks, uncommitedBlocks) = await NewGetAllBlockIdsAsync(blob);
 
                     // stage block
                     await blob.StageBlockAsync(blockid, stream, contentHash, conditions);
@@ -390,7 +407,7 @@ public class proof_of_concept : IDisposable
                         {
                             if (e.Status == 412)
                             {
-                                (etag, lastModified, commitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+                                (etag, lastModified, commitedBlocks, uncommitedBlocks) = await NewGetAllBlockIdsAsync(blob);
                             }
                             else
                                 throw;
@@ -400,7 +417,7 @@ public class proof_of_concept : IDisposable
                 });
             }
         }
-        
+
 
         Task.WaitAll(tasks);
 
