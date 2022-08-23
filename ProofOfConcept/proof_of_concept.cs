@@ -5,15 +5,13 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text;
-using System.Threading;
-using System.Collections.Concurrent;
 using System.Threading.Tasks;
 using Xunit;
 using System.Security.Cryptography;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
 using Azure.Storage.Blobs.Models;
-
+using Azure;
 
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Specialized;
@@ -24,15 +22,15 @@ public class proof_of_concept : IDisposable
     private const string _connectionString =
         "DefaultEndpointsProtocol=https;AccountName=bigfilestest;AccountKey=YvclLEtAM0FvgBkgbTQV6Xch97GOMxgR2fanGm/WSIJkOfVZ7oTEWHwxeXegUBR39oKdSFqahpugGAx5dknpIQ==";
 
-    private int _blockNum = 5;
+    private int _blockNum = 3;
 
-    private int _repetitionNum = 100;
+    private int _repetitionNum = 4;
 
     private byte[] _buffer;
 
     public proof_of_concept()
     {
-        _buffer = new byte[1024 * 1024 / 8];
+        _buffer = new byte[1024 * 1024 * 4];
     }
 
     public string Base64Encode(string plainText)
@@ -69,12 +67,14 @@ public class proof_of_concept : IDisposable
     [Fact]
     public async void parallel_writing_workaround()
     {
+        var blobid = "newlib" + Guid.NewGuid().ToString();
+        var blobServiceClient = new BlobServiceClient(_connectionString);
+        var containerName = "dev-new";
+
         var client = CloudStorageAccount.Parse(_connectionString).CreateCloudBlobClient();
-        var logBlobContainerName = "dev-" + Guid.NewGuid().ToString();
-        var container = client.GetContainerReference(logBlobContainerName);
+        var container = client.GetContainerReference(containerName);
         container.CreateIfNotExistsAsync().Wait();
 
-        var blobid = "workaround";
         var blob = container.GetBlockBlobReference(blobid);
 
         var contentHash = Convert.ToBase64String(MD5.Create().ComputeHash(_buffer, 0, _buffer.Length));
@@ -152,12 +152,14 @@ public class proof_of_concept : IDisposable
     [Fact]
     public async void parallel_writing_wished()
     {
+        var blobid = "newlib" + Guid.NewGuid().ToString();
+        var blobServiceClient = new BlobServiceClient(_connectionString);
+        var containerName = "dev-new";
+
         var client = CloudStorageAccount.Parse(_connectionString).CreateCloudBlobClient();
-        var logBlobContainerName = "dev-" + Guid.NewGuid().ToString();
-        var container = client.GetContainerReference(logBlobContainerName);
+        var container = client.GetContainerReference(containerName);
         container.CreateIfNotExistsAsync().Wait();
 
-        var blobid = "wished";
         var blob = container.GetBlockBlobReference(blobid);
 
         var contentHash = Convert.ToBase64String(MD5.Create().ComputeHash(_buffer, 0, _buffer.Length));
@@ -243,9 +245,9 @@ public class proof_of_concept : IDisposable
     {
         try
         {
-            var etag = blob.GetProperties().Value.ETag;
-            var lastModified = blob.GetProperties().Value.LastModified;
-
+            var props = blob.GetProperties();
+            var etag = props.Value.ETag;
+            var lastModified = props.Value.LastModified;
             var blockItems = await blob.GetBlockListAsync();
             var commitedBlockIds = blockItems.Value.CommittedBlocks.Select(b => b.Name).ToList();
             var uncommitedBlockIds = blockItems.Value.UncommittedBlocks.Select(b => b.Name).ToList();
@@ -265,17 +267,18 @@ public class proof_of_concept : IDisposable
     [Fact]
     public async void new_library_workaround()
     {
-        var blobid = "newlib";
+        var blobid = "newlib" + Guid.NewGuid().ToString();
         var blobServiceClient = new BlobServiceClient(_connectionString);
-        var containerName = "dev-new-" + Guid.NewGuid().ToString();
-        var containerClient = await blobServiceClient.CreateBlobContainerAsync(containerName);
+        var containerName = "dev-new";
+        var containerClient = blobServiceClient.GetBlobContainerClient(containerName);
         var contentHash = MD5.Create().ComputeHash(_buffer, 0, _buffer.Length);
-        var blob = containerClient.Value.GetBlockBlobClient(blobid);
+        var blob = containerClient.GetBlockBlobClient(blobid);
         blob.CommitBlockList(new List<string>());
 
         var tasks = new Task[_blockNum];
         var error400 = 0;
         var error412 = 0;
+        var conditions = new BlobRequestConditions();
 
         for (int reps = 0; reps < _repetitionNum; reps++)
         {
@@ -285,7 +288,6 @@ public class proof_of_concept : IDisposable
                 {
                     var stream = new MemoryStream(_buffer);
                     var blockid = GetNewBlockId();
-                    var conditions = new BlobRequestConditions();
 
                     while (true)
                     {
@@ -300,19 +302,18 @@ public class proof_of_concept : IDisposable
 
                             // stage block
                             await blob.StageBlockAsync(blockid, stream, contentHash);
-                            
+
                             if (!commitedBlocks.Contains(blockid))
                                 commitedBlocks.Add(blockid);
 
                             conditions.IfMatch = etag;
-                            conditions.IfUnmodifiedSince = lastModified;
 
                             // commit block
                             await blob.CommitBlockListAsync(
                                 commitedBlocks,
                                 conditions: conditions);
 
-                            var  (_, _, writtenBlocks, unwrittenBlocks) = await NewGetAllBlockIdsAsync(blob);
+                            var (_, _, writtenBlocks, unwrittenBlocks) = await NewGetAllBlockIdsAsync(blob);
                             if (Enumerable.SequenceEqual(commitedBlocks, writtenBlocks))
                                 break;
                         }
@@ -356,11 +357,103 @@ public class proof_of_concept : IDisposable
 
 
     [Fact]
+    public async void newlib_test_alg()
+    {
+        var blobid = "newlib" + Guid.NewGuid().ToString();
+        var blobServiceClient = new BlobServiceClient(_connectionString);
+        var containerName = "dev-new";
+        var containerClient = blobServiceClient.GetBlobContainerClient(containerName);
+        var contentHash = MD5.Create().ComputeHash(_buffer, 0, _buffer.Length);
+        var blob = containerClient.GetBlockBlobClient(blobid);
+        blob.CommitBlockList(new List<string>());
+
+        var tasks = new Task[_blockNum];
+        var error412 = 0;
+        var conditions = new BlobRequestConditions();
+
+        var sentBytes = 0;
+        var resentBytes = 0;
+
+        for (int reps = 0; reps < _repetitionNum; reps++)
+        {
+            for (int i = 0; i < _blockNum; i++)
+            {
+                tasks[i] = Task.Run(async () =>
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(new Random(Guid.NewGuid().GetHashCode()).Next(0, 6000)));
+
+                    var stream = new MemoryStream(_buffer);
+                    var blockid = GetNewBlockId();
+                    var conditions = new BlobRequestConditions();
+
+                    var (etag, lastModified, blobCommitedBlocks, uncommitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+                    var shouldStage = true;
+                    var sendingCounter = 0;
+                    while (true)
+                    {
+                        stream.Position = 0;
+                        try
+                        {
+                            if (shouldStage)
+                            {
+                                await blob.StageBlockAsync(blockid, stream, contentHash);
+                                sentBytes += _buffer.Length;
+                                if (sendingCounter > 0)
+                                {
+                                    resentBytes += _buffer.Length;
+                                }
+                            }
+                            sendingCounter++;
+
+                            if (!blobCommitedBlocks.Contains(blockid))
+                                blobCommitedBlocks.Add(blockid);
+
+                            conditions.IfMatch = etag;
+
+                            await blob.CommitBlockListAsync(
+                                blobCommitedBlocks,
+                                conditions: conditions);
+                            break;
+                        }
+                        catch (RequestFailedException e)
+                        {
+                            if (e.Status == 412)
+                            {
+                                error412++;
+
+                                // Decide whether to repeat staging or to repeat commiting
+                                (etag, lastModified, blobCommitedBlocks, uncommitedBlocks) = await NewGetAllBlockIdsAsync(blob);
+
+                                if (uncommitedBlocks.Contains(blockid))
+                                    shouldStage = false;
+                                else
+                                    shouldStage = true;
+                            }
+                            else
+                            {
+                                throw;
+                            }
+                        }
+                    }
+                });
+            }
+            Task.WaitAll(tasks);
+        }
+
+        var blocks = await blob.GetBlockListAsync();
+
+        Assert.Equal(
+            (0, _blockNum * _repetitionNum),
+            ((int)((float)resentBytes / (float)sentBytes * 100), blocks.Value.CommittedBlocks.ToArray().Length));
+
+    }
+
+    [Fact]
     public async void new_library_wished()
     {
-        var blobid = "newlib";
+        var blobid = "newlib" + Guid.NewGuid().ToString();
         var blobServiceClient = new BlobServiceClient(_connectionString);
-        var containerName = "dev-new-" + Guid.NewGuid().ToString();
+        var containerName = "dev-new";
         var containerClient = await blobServiceClient.CreateBlobContainerAsync(containerName);
         var blob = containerClient.Value.GetBlockBlobClient(blobid);
         var contentHash = MD5.Create().ComputeHash(_buffer, 0, _buffer.Length);
@@ -423,6 +516,106 @@ public class proof_of_concept : IDisposable
 
         var blocks = await blob.GetBlockListAsync();
         Assert.Equal(_blockNum, actual: blocks.Value.CommittedBlocks.ToArray().Length);
+    }
+
+    private async Task<BlobLease> AcquireLease(BlobLeaseClient leaseClient, string lid)
+    {
+        var conditions = new BlobRequestConditions();
+        conditions.LeaseId = lid;
+        var msa = 400;
+        var msb = 1200;
+        while (true)
+        {
+            try
+            {
+                return await leaseClient.AcquireAsync(TimeSpan.FromSeconds(15), conditions);
+            }
+            catch (RequestFailedException ex)
+            {
+                // The error 409 means that the blob is already leased and we have to wait.
+                if (ex.Status != 409)
+                    throw;
+                else
+                    await Task.Delay(TimeSpan.FromMilliseconds(new Random(Guid.NewGuid().GetHashCode()).Next(msa, msb)));
+            }
+        }
+    }
+
+    private async Task<List<string>> GetCommitedBlocks(BlockBlobClient blob)
+    {
+        try
+        {
+            var blockItems = await blob.GetBlockListAsync();
+            var commitedBlockIds = blockItems.Value.CommittedBlocks.Select(b => b.Name).ToList();
+            return commitedBlockIds;
+        }
+        // Storage exception can be thrown if there is no any written blob.
+        catch (RequestFailedException e)
+        {
+            if (e.Status == 404)
+                return new List<string>();
+            else
+                throw;
+        }
+    }
+
+    [Fact]
+    public async void newlib_sync_alg()
+    {
+        var blobid = "newlib" + Guid.NewGuid().ToString();
+        var blobServiceClient = new BlobServiceClient(_connectionString);
+        var containerName = "dev-new-1";
+        var containerClient = blobServiceClient.GetBlobContainerClient(containerName);
+        containerClient.CreateIfNotExists();
+        var contentHash = MD5.Create().ComputeHash(_buffer, 0, _buffer.Length);
+        var blob = containerClient.GetBlockBlobClient(blobid);
+        blob.CommitBlockList(new List<string>());
+
+        var tasks = new Task[_blockNum];
+
+        for (int reps = 0; reps < _repetitionNum; reps++)
+        {
+            for (int i = 0; i < _blockNum; i++)
+            {
+                tasks[i] = Task.Run(async () =>
+                {
+                    var leaseClient = blob.GetBlobLeaseClient();
+                    var blobLease = await AcquireLease(leaseClient, leaseClient.LeaseId);
+
+                    var conditions = new BlobRequestConditions();
+                    conditions.LeaseId = blobLease.LeaseId;
+
+                    var commitedBlocks = await GetCommitedBlocks(blob);
+
+                    var stream = new MemoryStream(_buffer);
+                    var blockid = GetNewBlockId();
+
+                    stream.Position = 0;
+
+                    // stage block
+                    await blob.StageBlockAsync(
+                        blockid,
+                        stream,
+                        contentHash,
+                        conditions: conditions);
+
+                    if (!commitedBlocks.Contains(blockid))
+                        commitedBlocks.Add(blockid);
+
+                    // commit block
+                    await blob.CommitBlockListAsync(
+                        commitedBlocks,
+                        conditions: conditions);
+
+                    await leaseClient.ReleaseAsync();
+                });
+            }
+            Task.WaitAll(tasks);
+        }
+
+        var blocks = await blob.GetBlockListAsync();
+
+        Assert.Equal(_blockNum * _repetitionNum, blocks.Value.CommittedBlocks.ToArray().Length);
     }
 
     public void Dispose()
